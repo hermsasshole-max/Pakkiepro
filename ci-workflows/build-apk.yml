@@ -1,0 +1,150 @@
+name: Build Android APK (Capacitor)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+# Ensure concurrent runs do not conflict
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android-apk:
+    name: Build Native Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22 (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Java JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 21
+          cache: 'gradle'
+
+      - name: Accept Android SDK Licenses & Prepare Android SDK 36
+        run: |
+          mkdir -p "$ANDROID_HOME/licenses" || true
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "84831b9409646a532e303d725c4b378b164a3767" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "8933bad161af4178b1185d1a37fbf41ea5269c55" >> "$ANDROID_HOME/licenses/android-sdk-preview-license"
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "platforms;android-35" "platforms;android-34" "build-tools;36.0.0" "build-tools;35.0.0" "build-tools;34.0.0" || true
+
+      - name: Install NPM Dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || (echo "Lockfile desync detected, falling back to npm install..." && npm install)
+          else
+            npm install
+          fi
+
+      - name: Generate PWA Assets & Build Production Web Dist
+        run: |
+          node generate-icons.js --force
+          npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Sync Capacitor Android Project & Align AGP 9.0.1
+        run: |
+          npx cap sync android
+          PKG_VER=$(node -p "require('./package.json').version || '1.7.0'")
+          if [ -f "android/app/src/main/res/xml/config.xml" ]; then
+            sed -i.bak "s/version=\"[^\"]*\"/version=\"${PKG_VER}\"/" "android/app/src/main/res/xml/config.xml" && rm -f "android/app/src/main/res/xml/config.xml.bak" || true
+          fi
+          if [ -f "android/capacitor-cordova-android-plugins/build.gradle" ]; then
+            sed -i.bak "s/com\.android\.tools\.build:gradle:[0-9.]*/com.android.tools.build:gradle:9.0.1/g" "android/capacitor-cordova-android-plugins/build.gradle" && rm -f "android/capacitor-cordova-android-plugins/build.gradle.bak" || true
+          fi
+
+      - name: Setup Gradle 9.1.0 (for AGP 9.0.1)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.1.0'
+          validate-wrappers: false
+
+      - name: Build Debug APK with Gradle 9.1.0 + AGP 9.0.1
+        run: |
+          chmod +x android/gradlew || true
+          cd android
+          gradle --version
+          gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Verify and Locate Generated APK
+        run: |
+          echo "=== Locating generated APK files ==="
+          find android/app/build/outputs/apk -name "*.apk" -exec ls -lh {} +
+
+      - name: Upload Native Android APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish Direct APK Download to GitHub Releases
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="v1.0-debug"
+          APK_PATH="android/app/build/outputs/apk/debug/app-debug.apk"
+          
+          if [ -f "$APK_PATH" ]; then
+            echo "Publishing direct download APK to GitHub Releases tag $TAG_NAME..."
+            NOTES_FILE="${RUNNER_TEMP}/apk-release-notes.md"
+            {
+              echo "### Direct 1-Click APK Download"
+              echo "- **Direct Download**: **[app-debug.apk](https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/app-debug.apk)**"
+              echo "- **Built from commit**: \`${{ github.sha }}\`"
+              echo "- **Built on**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            } > "$NOTES_FILE"
+
+            if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+              gh release upload "$TAG_NAME" "$APK_PATH" --clobber || echo "GitHub Release upload skipped"
+              gh release edit "$TAG_NAME" --notes-file "$NOTES_FILE" || true
+            else
+              gh release create "$TAG_NAME" "$APK_PATH" \
+                --title "ParserPro Android Debug APK (Direct Download)" \
+                --notes-file "$NOTES_FILE" \
+                --prerelease || echo "GitHub Release creation skipped"
+            fi
+          else
+            echo "APK file not found at $APK_PATH"
+          fi
+
+      - name: Add Direct Download Links to Run Summary
+        if: always()
+        run: |
+          echo "# 📱 Android Debug APK Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "android/app/build/outputs/apk/debug/app-debug.apk" ]; then
+            APK_SIZE=$(ls -lh android/app/build/outputs/apk/debug/app-debug.apk | awk '{print $5}')
+            APK_SHA=$(sha256sum android/app/build/outputs/apk/debug/app-debug.apk | awk '{print $1}')
+            echo "### ✅ Build Succeeded!" >> $GITHUB_STEP_SUMMARY
+            echo "- **File**: \`app-debug.apk\` (${APK_SIZE})" >> $GITHUB_STEP_SUMMARY
+            echo "- **SHA256**: \`${APK_SHA}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📥 How to Download:" >> $GITHUB_STEP_SUMMARY
+            echo "1. **Direct 1-Click APK (No unzipping needed)**: Open **[GitHub Releases](https://github.com/${{ github.repository }}/releases)** and download \`app-debug.apk\` directly." >> $GITHUB_STEP_SUMMARY
+            echo "2. **Actions Artifact**: In the **Artifacts** section at the bottom of this page, click **\`app-debug\`** (Note: GitHub requires you to be logged into your GitHub account to download Actions artifacts)." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ APK file was not found" >> $GITHUB_STEP_SUMMARY
+          fi

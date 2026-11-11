@@ -1,0 +1,92 @@
+# ==============================================================================
+# R8 / ProGuard Rules for ParserPro (com.receiptscannerpro.app)
+# Configured for Google Play Console DEX Code Optimization & Crash Deobfuscation
+# ==============================================================================
+
+# Preserve line numbers and source file attribute so Google Play Console can
+# accurately deobfuscate stack traces using mapping.txt / embedded proguard.map
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
+
+# Preserve annotations, generics signatures, and enclosing methods required by
+# Capacitor runtime reflection, Kotlin metadata, and Gson serialization
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod,Exceptions
+
+# Keep app entry point Activity & package classes
+-keep public class com.receiptscannerpro.app.** { *; }
+
+# Keep WebView JavaScript bridge methods (@JavascriptInterface)
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
+
+# Keep Capacitor core bridge & runtime-loaded plugin classes
+# (PluginManager loads plugins dynamically via Class.forName from capacitor.plugins.json)
+-keep class com.getcapacitor.** { *; }
+-keep @com.getcapacitor.annotation.CapacitorPlugin class * { *; }
+-keep @com.getcapacitor.NativePlugin class * { *; }
+-keep public class * extends com.getcapacitor.Plugin { *; }
+-keep public class * extends com.getcapacitor.BridgeActivity { *; }
+
+# Keep Capacitor official plugins (@capacitor/camera, @capacitor/filesystem, @capacitor/share)
+# and Ionic native camera/filesystem helper & model classes
+-keep class com.capacitorjs.plugins.** { *; }
+-keep class io.ionic.libs.** { *; }
+
+# Keep Cordova compatibility plugin layer
+-keep class org.apache.cordova.** { *; }
+-keep public class * extends org.apache.cordova.CordovaPlugin { *; }
+
+# Keep Gson classes, reflection TypeTokens & @SerializedName fields under R8 Full Mode (used by @capacitor/camera)
+-keep class com.google.gson.** { *; }
+-keep class * extends com.google.gson.reflect.TypeToken { *; }
+-keepclassmembers,allowobfuscation class * {
+    @com.google.gson.annotations.SerializedName <fields>;
+    <init>();
+}
+
+# Keep AndroidX Startup initializers declared in merged AndroidManifest.xml
+-keep class * implements androidx.startup.Initializer {
+    public <init>();
+}
+
+# Preserve Kotlin metadata for coroutines & Ionic/Capacitor Kotlin plugins
+-keep class kotlin.Metadata { *; }
+
+# Keep Google Play Billing Library v8 AIDL & model classes
+-keep class com.android.billingclient.** { *; }
+
+# Keep Google ML Kit On-Device Text Recognition, Dynamite descriptors, ComponentRegistrars & JNI pipeline
+-keep class com.google.mlkit.** { *; }
+-keep class com.google.android.gms.dynamite.** { *; }
+-keep class com.google.android.libraries.vision.visionkit.** { *; }
+-keep class com.google.android.odml.** { *; }
+-keep class * implements com.google.firebase.components.ComponentRegistrar { *; }
+-keep @com.google.android.gms.common.util.DynamiteApi public class * {
+    public <fields>;
+    public <methods>;
+}
+-keep @com.google.android.gms.common.annotation.KeepName class *
+-keepclassmembers class * {
+    @com.google.android.gms.common.annotation.KeepName *;
+}
+-keepclasseswithmembernames,includedescriptorclasses class * {
+    native <methods>;
+}
+
+-keep class com.google.android.gms.common.** { *; }
+-keep class com.google.android.gms.tasks.** { *; }
+
+# Ignore optional JVM-only / compile-time annotation classes referenced by transitive libraries
+-dontwarn sun.misc.**
+-dontwarn java.lang.instrument.**
+-dontwarn org.slf4j.**
+-dontwarn javax.annotation.**
+-dontwarn javax.inject.**
+-dontwarn com.google.android.datatransport.**
+-dontwarn com.google.errorprone.annotations.**
+-dontwarn org.codehaus.mojo.animal_sniffer.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**
+-dontwarn dalvik.system.**

@@ -1,0 +1,138 @@
+apply plugin: 'com.android.application'
+
+def repoSigningPropsFile = file("../signing/keystore.properties")
+def repoSigningProps = new Properties()
+if (repoSigningPropsFile.exists()) {
+    repoSigningPropsFile.withInputStream { stream -> repoSigningProps.load(stream) }
+}
+def repoKeystoreFile = repoSigningProps.getProperty("storeFile")
+    ? file("../signing/${repoSigningProps.getProperty('storeFile').trim()}")
+    : null
+
+def keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")?.trim()
+def keystorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+def keyAliasName = System.getenv("ANDROID_KEY_ALIAS")?.trim()
+def keyAliasPassword = System.getenv("ANDROID_KEY_PASSWORD")
+
+if ((!keystorePath || !file(keystorePath).exists()) && repoKeystoreFile != null && repoKeystoreFile.exists()) {
+    keystorePath = repoKeystoreFile.absolutePath
+    keystorePassword = repoSigningProps.getProperty("storePassword")
+    keyAliasName = repoSigningProps.getProperty("keyAlias")
+    keyAliasPassword = repoSigningProps.getProperty("keyPassword") ?: keystorePassword
+}
+def hasReleaseKeystore = keystorePath && file(keystorePath).exists() && keystorePassword && keyAliasName && keyAliasPassword
+
+def envVersionCode = System.getenv("ANDROID_VERSION_CODE")?.trim()
+def envVersionName = System.getenv("ANDROID_VERSION_NAME")?.trim()
+def ghRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.trim()
+def ghRunAttempt = System.getenv("GITHUB_RUN_ATTEMPT")?.trim()
+def minVersionCode = 3000
+def ghAutoVersionCode = (ghRunNumber && ghRunNumber.isInteger())
+    ? (3000 + ghRunNumber.toInteger() + ((ghRunAttempt && ghRunAttempt.isInteger()) ? Math.max(0, ghRunAttempt.toInteger() - 1) : 0))
+    : minVersionCode
+def resolvedVersionCode = (envVersionCode && envVersionCode.isInteger())
+    ? Math.max(minVersionCode, envVersionCode.toInteger())
+    : Math.max(minVersionCode, ghAutoVersionCode)
+def resolvedVersionName = envVersionName ?: "1.9.${Math.max(0, resolvedVersionCode - 3000)}"
+
+// Output resolved version details to the Gradle build logs for Play Console verification
+println "==================================================================="
+println " [ParserPro Play Store Build Info]"
+println "   * GITHUB_RUN_NUMBER:    ${ghRunNumber ?: '(local build / unset)'}"
+println "   * GITHUB_RUN_ATTEMPT:   ${ghRunAttempt ?: '1'}"
+println "   * Env VersionCode:      ${envVersionCode ?: '(not passed directly)'}"
+println "   * Resolved versionCode: ${resolvedVersionCode} (Strictly > Play Console 245; Floor: >= ${minVersionCode})"
+println "   * Resolved versionName: ${resolvedVersionName}"
+println "==================================================================="
+
+def envNdkPath = System.getenv("ANDROID_NDK_PATH") ?: System.getenv("ANDROID_NDK_LATEST_HOME")
+def envNdkVersion = System.getenv("ANDROID_NDK_VERSION")
+
+android {
+    namespace = "com.receiptscannerpro.app"
+    compileSdk = rootProject.ext.compileSdkVersion
+    if (envNdkPath && file(envNdkPath).exists()) {
+        ndkPath = envNdkPath
+    } else if (envNdkVersion) {
+        ndkVersion = envNdkVersion
+    }
+    defaultConfig {
+        applicationId "com.receiptscannerpro.app"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode resolvedVersionCode
+        versionName resolvedVersionName
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        ndk {
+            debugSymbolLevel = 'FULL'
+            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+        }
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            release {
+                storeFile file(keystorePath)
+                storePassword keystorePassword
+                keyAlias keyAliasName
+                keyPassword keyAliasPassword
+            }
+        }
+    }
+    buildTypes {
+        release {
+            if (hasReleaseKeystore) {
+                signingConfig signingConfigs.release
+            }
+            ndk {
+                debugSymbolLevel = 'FULL'
+            }
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    lintOptions {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    implementation "com.google.mlkit:text-recognition:16.0.1"
+    implementation "com.android.billingclient:billing:8.3.0"
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}

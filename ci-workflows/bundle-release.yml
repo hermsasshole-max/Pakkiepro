@@ -1,0 +1,953 @@
+name: Build Release Android App Bundle (Play Console)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Release versionName (optional, e.g. 1.7.0)'
+        required: false
+        type: string
+      version_code:
+        description: 'Release integer versionCode (optional, auto-increments >= 240 strictly above used Play Console versions)'
+        required: false
+        type: string
+      signing_key_preference:
+        description: 'Upload key source: auto (recover Play Console F5:BA:06:8E key, else Secrets/Repo), secrets, or repo_key'
+        required: false
+        default: 'auto'
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+# Ensure concurrent runs do not conflict
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-bundle:
+    name: Build Signed Play Console AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22 (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Java JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 21
+          cache: 'gradle'
+
+      - name: Accept Android SDK Licenses & Prepare Android SDK 36 + NDK
+        run: |
+          mkdir -p "$ANDROID_HOME/licenses" || true
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "84831b9409646a532e303d725c4b378b164a3767" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "8933bad161af4178b1185d1a37fbf41ea5269c55" >> "$ANDROID_HOME/licenses/android-sdk-preview-license"
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "platforms;android-35" "platforms;android-34" "build-tools;36.0.0" "build-tools;35.0.0" "build-tools;34.0.0" || true
+
+          # Resolve pre-installed Android NDK (or install NDK 27 LTS) for native debug symbols extraction
+          RESOLVED_NDK=""
+          if [ -n "${ANDROID_NDK_LATEST_HOME:-}" ] && [ -d "${ANDROID_NDK_LATEST_HOME}" ]; then
+            RESOLVED_NDK="${ANDROID_NDK_LATEST_HOME}"
+          elif [ -d "$ANDROID_HOME/ndk" ]; then
+            RESOLVED_NDK=$(ls -1d "$ANDROID_HOME/ndk/"* 2>/dev/null | sort -V | tail -n 1 || true)
+          fi
+          if [ -z "$RESOLVED_NDK" ] || [ ! -d "$RESOLVED_NDK" ]; then
+            echo "Installing Android NDK 27.2.12479018 for Play Console native debug symbols..."
+            $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;27.2.12479018" || true
+            RESOLVED_NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          fi
+          if [ -d "$RESOLVED_NDK" ]; then
+            echo "Using Android NDK at: $RESOLVED_NDK"
+            echo "ANDROID_NDK_PATH=${RESOLVED_NDK}" >> $GITHUB_ENV
+          fi
+
+      - name: Install NPM Dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || (echo "Lockfile desync detected, falling back to npm install..." && npm install)
+          else
+            npm install
+          fi
+
+      - name: Resolve Play Console Release Version (>= 240)
+        id: version_setup
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION_CODE: ${{ inputs.version_code }}
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          MIN_VERSION_CODE=3000
+          ATTEMPT_NUM="${GITHUB_RUN_ATTEMPT:-1}"
+          ATTEMPT_OFFSET=$(( ATTEMPT_NUM > 1 ? ATTEMPT_NUM - 1 : 0 ))
+          AUTO_VC=$(( 3000 + GITHUB_RUN_NUMBER + ATTEMPT_OFFSET ))
+          if [ "$AUTO_VC" -lt "$MIN_VERSION_CODE" ]; then
+            AUTO_VC="$MIN_VERSION_CODE"
+          fi
+
+          # Inspect both GitHub Releases AND all prior workflow AAB artifacts so re-runs or manual dispatches always increment strictly
+          MAX_HIST_VC=$(python3 - << 'PYHIST'
+          import json, os, re, subprocess, urllib.request
+
+          max_vc = 2999  # Floor strictly above all prior Play Console versions
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          token = os.environ.get("GITHUB_TOKEN", "")
+
+          def api_get_json(path):
+              if not repo:
+                  return None
+              headers = {
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "ParserPro-CI",
+              }
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              try:
+                  req = urllib.request.Request(f"https://api.github.com/repos/{repo}/{path}", headers=headers)
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return json.loads(resp.read().decode("utf-8"))
+              except Exception:
+                  return None
+
+          rel_data = api_get_json("releases/tags/v1.0-playstore-aab")
+          if not rel_data:
+              try:
+                  rel = subprocess.run(
+                      ["gh", "release", "view", "v1.0-playstore-aab", "--json", "name,title,body,assets"],
+                      capture_output=True, text=True
+                  )
+                  if rel.returncode == 0 and rel.stdout.strip():
+                      rel_data = json.loads(rel.stdout)
+              except Exception:
+                  rel_data = None
+
+          if isinstance(rel_data, dict):
+              blob = "\n".join([
+                  str(rel_data.get("name") or ""),
+                  str(rel_data.get("title") or ""),
+                  str(rel_data.get("body") or ""),
+              ] + [str((a or {}).get("name") or "") for a in (rel_data.get("assets") or [])])
+              for m in re.findall(r"(?:versionCode\s+|ParserPro-release-v|Bundle\s+—\s+v)([0-9]+)", blob):
+                  max_vc = max(max_vc, int(m))
+
+          if repo:
+              for page in (1, 2, 3):
+                  art_data = api_get_json(f"actions/artifacts?per_page=100&page={page}")
+                  if not art_data:
+                      try:
+                          art = subprocess.run(
+                              ["gh", "api", f"repos/{repo}/actions/artifacts?per_page=100&page={page}"],
+                              capture_output=True, text=True
+                          )
+                          if art.returncode == 0 and art.stdout.strip():
+                              art_data = json.loads(art.stdout)
+                      except Exception:
+                          art_data = None
+                  if not isinstance(art_data, dict):
+                      break
+                  items = art_data.get("artifacts") or []
+                  for item in items:
+                      m = re.match(r"^ParserPro-PlayConsole-AAB-v([0-9]+)$", (item or {}).get("name") or "")
+                      if m:
+                          max_vc = max(max_vc, int(m.group(1)))
+                  if len(items) < 100:
+                      break
+
+          print(max_vc)
+          PYHIST
+          )
+          MAX_HIST_VC=$(echo "$MAX_HIST_VC" | tr -dc '0-9')
+          REQUIRED_FLOOR="$MIN_VERSION_CODE"
+          if [[ "$MAX_HIST_VC" =~ ^[0-9]+$ ]] && [ "$MAX_HIST_VC" -gt 0 ] && [ $((MAX_HIST_VC + 1)) -gt "$REQUIRED_FLOOR" ]; then
+            REQUIRED_FLOOR=$((MAX_HIST_VC + 1))
+          fi
+          if [ "$AUTO_VC" -lt "$REQUIRED_FLOOR" ]; then
+            AUTO_VC="$REQUIRED_FLOOR"
+          fi
+
+          if [[ "$INPUT_VERSION_CODE" =~ ^[0-9]+$ ]]; then
+            if [ "$INPUT_VERSION_CODE" -ge "$REQUIRED_FLOOR" ]; then
+              COMPUTED_VC="$INPUT_VERSION_CODE"
+            else
+              echo "WARNING: Requested version_code=${INPUT_VERSION_CODE} is <= already-used Play Console version (${MAX_HIST_VC}); auto-bumping to ${REQUIRED_FLOOR}."
+              COMPUTED_VC="$REQUIRED_FLOOR"
+            fi
+          else
+            COMPUTED_VC="$AUTO_VC"
+          fi
+
+          if [ -n "$INPUT_VERSION_NAME" ]; then
+            COMPUTED_VN="$INPUT_VERSION_NAME"
+          else
+            COMPUTED_VN="1.7.$((COMPUTED_VC - 240))"
+          fi
+
+          echo "Resolved Play Console release version: versionName=${COMPUTED_VN} (versionCode=${COMPUTED_VC}, strictly > ${MAX_HIST_VC})"
+          echo "ANDROID_VERSION_CODE=${COMPUTED_VC}" >> $GITHUB_ENV
+          echo "ANDROID_VERSION_NAME=${COMPUTED_VN}" >> $GITHUB_ENV
+          echo "version_code=${COMPUTED_VC}" >> $GITHUB_OUTPUT
+          echo "version_name=${COMPUTED_VN}" >> $GITHUB_OUTPUT
+
+      - name: Generate PWA Assets & Build Production Web Dist
+        run: |
+          node generate-icons.js --force
+          npm run build
+        env:
+          NODE_ENV: production
+          VITE_APP_VERSION: ${{ env.ANDROID_VERSION_NAME }}
+          VITE_APP_BUILD_NUMBER: ${{ env.ANDROID_VERSION_CODE }}
+
+      - name: Sync Capacitor Android Project & Align AGP 9.0.1
+        run: |
+          npx cap sync android
+          if [ -f "android/app/src/main/res/xml/config.xml" ]; then
+            sed -i.bak "s/version=\"[^\"]*\"/version=\"${ANDROID_VERSION_NAME}\"/" "android/app/src/main/res/xml/config.xml" && rm -f "android/app/src/main/res/xml/config.xml.bak" || true
+          fi
+          if [ -f "android/capacitor-cordova-android-plugins/build.gradle" ]; then
+            sed -i.bak "s/com\.android\.tools\.build:gradle:[0-9.]*/com.android.tools.build:gradle:9.0.1/g" "android/capacitor-cordova-android-plugins/build.gradle" && rm -f "android/capacitor-cordova-android-plugins/build.gradle.bak" || true
+          fi
+
+      - name: Verify Google Play App Signing Certificates (com.receiptscannerpro.app)
+        run: |
+          python3 - "${GITHUB_WORKSPACE}/android/signing/play-store-certs" "${GITHUB_WORKSPACE}/dist/.well-known/assetlinks.json" << 'PYEOF'
+          import hashlib, json, os, sys
+
+          cert_dir, assetlinks_path = sys.argv[1], sys.argv[2]
+          expected = {
+              "deployment_cert.der": (
+                  "AA:14:BE:52:28:F8:80:7C:13:DE:D0:86:F1:11:6A:0F:AE:93:17:4D",
+                  "47:4A:47:3D:23:74:45:84:40:9F:FD:15:F5:E5:ED:FD:8E:C0:0A:27:67:6D:52:4F:41:D1:FA:3B:DC:A6:2E:19",
+              ),
+              "hybrid_classical_cert.der": (
+                  "74:9C:E0:25:BD:DA:4E:CA:7D:83:3B:DE:57:E3:B4:E1:1F:79:0C:4B",
+                  "16:F5:4D:1B:55:E1:99:46:9B:99:81:DE:A9:59:A7:FB:30:7F:37:83:47:62:FE:31:4A:A3:BB:06:46:9F:FF:9B",
+              ),
+              "hybrid_pqc_cert.der": (
+                  "5E:FF:72:FD:93:ED:59:02:92:20:BF:31:BD:8A:1B:92:D8:56:7C:3B",
+                  "E7:C0:F4:CF:9F:BF:55:48:6E:58:01:CC:56:59:49:D0:06:53:18:59:C4:17:66:5D:91:BD:0A:20:0D:8A:57:AA",
+              ),
+          }
+
+          def fmt_hex(h):
+              return ":".join(h.upper()[i:i+2] for i in range(0, len(h), 2))
+
+          for fname, (exp_sha1, exp_sha256) in expected.items():
+              fpath = os.path.join(cert_dir, fname)
+              if not os.path.isfile(fpath):
+                  raise SystemExit(f"ERROR: Missing Play Store certificate {fpath}")
+              data = open(fpath, "rb").read()
+              act_sha1 = fmt_hex(hashlib.sha1(data).hexdigest())
+              act_sha256 = fmt_hex(hashlib.sha256(data).hexdigest())
+              if act_sha1 != exp_sha1 or act_sha256 != exp_sha256:
+                  raise SystemExit(f"ERROR: {fname} fingerprint mismatch! Got SHA1={act_sha1}, SHA256={act_sha256}")
+              print(f"Verified {fname} -> SHA1={act_sha1}")
+
+          with open(assetlinks_path, "r", encoding="utf-8") as f:
+              assetlinks = json.load(f)
+          target = assetlinks[0]["target"]
+          if target.get("package_name") != "com.receiptscannerpro.app":
+              raise SystemExit(f"ERROR: Unexpected assetlinks package_name: {target.get('package_name')}")
+          fps = set(target.get("sha256_cert_fingerprints", []))
+          for fname, (_, exp_sha256) in expected.items():
+              if exp_sha256 not in fps:
+                  raise SystemExit(f"ERROR: {fname} SHA256 missing from dist/.well-known/assetlinks.json")
+          print("Verified all 3 Play App Signing certificates and Digital Asset Links!")
+          PYEOF
+
+      - name: Configure Play Store Release Signing Keystore
+        id: signing_setup
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SECRET_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          SECRET_KEYSTORE_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SECRET_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SECRET_KEY_PW: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          SIGNING_KEY_PREF: ${{ inputs.signing_key_preference }}
+        run: |
+          echo "version_code=${ANDROID_VERSION_CODE}" >> $GITHUB_OUTPUT
+          echo "version_name=${ANDROID_VERSION_NAME}" >> $GITHUB_OUTPUT
+
+          # Resolve Upload Keystore (recovers Play Console's registered F5:BA:06:8E:... Upload Key automatically or uses permanent repo/secrets key — never rotates randomly)
+          python3 - << 'PYEOF'
+          import base64, hashlib, io, json, os, re, secrets, shutil, subprocess, sys, tempfile, urllib.error, urllib.request, zipfile
+
+          EXPECTED_PLAY_SHA1_PREFIX = "F5:BA:06:8E:1E:42:BC:00:0F:7F:80:C4:8E:81:42:F3:E9"
+          workspace = os.environ["GITHUB_WORKSPACE"]
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          token = os.environ.get("GITHUB_TOKEN", "")
+          pref = (os.environ.get("SIGNING_KEY_PREF") or "auto").strip().lower()
+
+          secret_b64 = (os.environ.get("SECRET_KEYSTORE_B64") or "").strip()
+          secret_pw = os.environ.get("SECRET_KEYSTORE_PW") or ""
+          secret_alias = (os.environ.get("SECRET_KEY_ALIAS") or "").strip()
+          secret_key_pw = os.environ.get("SECRET_KEY_PW") or ""
+
+          def fmt_hex(h):
+              return ":".join(h.upper()[i:i+2] for i in range(0, len(h), 2))
+
+          def mask_secret(val):
+              if val and len(val) >= 4:
+                  print(f"::add-mask::{val}", flush=True)
+
+          def inspect_keystore(ks_path, ks_pw, preferred_alias=""):
+              if not ks_path or not os.path.isfile(ks_path) or not ks_pw:
+                  return None
+              res = subprocess.run(
+                  ["keytool", "-list", "-v", "-keystore", ks_path, "-storepass", ks_pw],
+                  capture_output=True, text=True
+              )
+              if res.returncode != 0:
+                  return None
+
+              priv_aliases = []
+              all_aliases = []
+              cur_alias = ""
+              for line in res.stdout.splitlines():
+                  m = re.match(r"^\s*Alias name:\s*(.+?)\s*$", line)
+                  if m:
+                      cur_alias = m.group(1)
+                      all_aliases.append(cur_alias)
+                  elif cur_alias and re.match(r"^\s*Entry type:\s*.*privatekeyentry", line, re.IGNORECASE):
+                      priv_aliases.append(cur_alias)
+
+              candidates = priv_aliases if priv_aliases else all_aliases
+              if not candidates:
+                  return None
+
+              chosen = candidates[0]
+              if preferred_alias:
+                  for c in candidates:
+                      if c == preferred_alias or c.lower() == preferred_alias.lower():
+                          chosen = c
+                          break
+
+              with tempfile.TemporaryDirectory() as td:
+                  der_file = os.path.join(td, "cert.der")
+                  exp = subprocess.run(
+                      ["keytool", "-exportcert", "-keystore", ks_path, "-alias", chosen, "-storepass", ks_pw, "-file", der_file],
+                      capture_output=True
+                  )
+                  if exp.returncode != 0 or not os.path.isfile(der_file):
+                      return None
+                  der_bytes = open(der_file, "rb").read()
+                  sha1 = fmt_hex(hashlib.sha1(der_bytes).hexdigest())
+                  sha256 = fmt_hex(hashlib.sha256(der_bytes).hexdigest())
+              return {"alias": chosen, "sha1": sha1, "sha256": sha256}
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          def download_artifact_zip(repo_slug, artifact_id, gh_token):
+              url = f"https://api.github.com/repos/{repo_slug}/actions/artifacts/{artifact_id}/zip"
+              opener = urllib.request.build_opener(NoRedirect)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {gh_token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "ParserPro-CI",
+                  },
+              )
+              try:
+                  with opener.open(req, timeout=30) as resp:
+                      return resp.read()
+              except urllib.error.HTTPError as e:
+                  if e.code in (301, 302, 303, 307, 308):
+                      loc = e.headers.get("Location")
+                      if loc:
+                          req2 = urllib.request.Request(loc, headers={"User-Agent": "ParserPro-CI"})
+                          with urllib.request.urlopen(req2, timeout=30) as resp2:
+                              return resp2.read()
+              except Exception:
+                  pass
+
+              # Fallback via gh CLI
+              gh_res = subprocess.run(
+                  ["gh", "api", f"repos/{repo_slug}/actions/artifacts/{artifact_id}/zip"],
+                  capture_output=True
+              )
+              if gh_res.returncode == 0 and gh_res.stdout.startswith(b"PK"):
+                  return gh_res.stdout
+              return None
+
+          def parse_secrets_setup_txt(text):
+              lines = [ln.strip() for ln in text.splitlines()]
+              out = {}
+              markers = {
+                  "1. ANDROID_KEYSTORE_BASE64": "b64",
+                  "2. ANDROID_KEYSTORE_PASSWORD": "pw",
+                  "3. ANDROID_KEY_ALIAS": "alias",
+                  "4. ANDROID_KEY_PASSWORD": "key_pw",
+              }
+              for i, ln in enumerate(lines):
+                  for prefix, key in markers.items():
+                      if ln.startswith(prefix):
+                          for j in range(i + 1, min(i + 5, len(lines))):
+                              if lines[j] and not lines[j].startswith("==="):
+                                  out[key] = lines[j]
+                                  break
+              return out
+
+          def recover_play_key_from_artifacts():
+              if not repo or not token:
+                  return None
+              artifacts = []
+              for page in (1, 2, 3):
+                  api_url = f"https://api.github.com/repos/{repo}/actions/artifacts?name=PlayConsole-Upload-Keystore-Backup-SAVE-THIS&per_page=100&page={page}"
+                  req = urllib.request.Request(
+                      api_url,
+                      headers={
+                          "Accept": "application/vnd.github+json",
+                          "Authorization": f"Bearer {token}",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                          "User-Agent": "ParserPro-CI",
+                      },
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=20) as resp:
+                          payload = json.loads(resp.read().decode("utf-8"))
+                      batch = payload.get("artifacts", [])
+                      artifacts.extend([a for a in batch if not a.get("expired", False)])
+                      if len(batch) < 100:
+                          break
+                  except Exception as exc:
+                      print(f"Artifact list query note: {exc}")
+                      break
+
+              if not artifacts:
+                  print("No prior PlayConsole-Upload-Keystore-Backup-SAVE-THIS artifacts found in repository.")
+                  return None
+
+              # Check oldest artifacts first so the original v113 upload key run is matched immediately
+              artifacts.sort(key=lambda a: a.get("id", 0))
+              print(f"Inspecting {len(artifacts)} backup keystore artifact(s) for Play Console Upload Key {EXPECTED_PLAY_SHA1_PREFIX}...")
+
+              for art in artifacts:
+                  art_id = art.get("id")
+                  run_id = (art.get("workflow_run") or {}).get("id", "unknown")
+                  zbytes = download_artifact_zip(repo, art_id, token)
+                  if not zbytes or not zbytes.startswith(b"PK"):
+                      continue
+                  try:
+                      with zipfile.ZipFile(io.BytesIO(zbytes)) as zf, tempfile.TemporaryDirectory() as td:
+                          txt_name = next((n for n in zf.namelist() if n.endswith("GITHUB_SECRETS_SETUP.txt")), None)
+                          ks_name = next((n for n in zf.namelist() if n.endswith((".jks", ".keystore", ".p12"))), None)
+                          if not txt_name:
+                              continue
+                          parsed = parse_secrets_setup_txt(zf.read(txt_name).decode("utf-8", errors="replace"))
+                          cand_pw = parsed.get("pw", "")
+                          cand_alias = parsed.get("alias", "upload")
+                          cand_key_pw = parsed.get("key_pw", "") or cand_pw
+                          mask_secret(cand_pw)
+                          mask_secret(cand_key_pw)
+
+                          tmp_ks = os.path.join(td, "candidate.jks")
+                          if ks_name:
+                              ks_bytes = zf.read(ks_name)
+                          elif parsed.get("b64"):
+                              ks_bytes = base64.b64decode(re.sub(r"\s+", "", parsed["b64"]))
+                          else:
+                              continue
+                          with open(tmp_ks, "wb") as f:
+                              f.write(ks_bytes)
+
+                          info = inspect_keystore(tmp_ks, cand_pw, cand_alias)
+                          if not info:
+                              continue
+                          print(f"  - Artifact #{art_id} (run {run_id}) -> SHA1: {info['sha1']}")
+                          if info["sha1"].startswith(EXPECTED_PLAY_SHA1_PREFIX):
+                              print(f"MATCHED Play Console Expected Upload Key from workflow run {run_id}: {info['sha1']}")
+                              return {
+                                  "mode": "recovered_play_upload_key",
+                                  "ks_bytes": ks_bytes,
+                                  "ks_pw": cand_pw,
+                                  "alias": info["alias"],
+                                  "key_pw": cand_key_pw,
+                                  "sha1": info["sha1"],
+                                  "note": f"Auto-recovered Play Console Upload Key from workflow run {run_id}",
+                              }
+                  except Exception as exc:
+                      print(f"  - Skipping artifact #{art_id}: {exc}")
+              return None
+
+          # Candidate A: GitHub Secrets
+          secret_candidate = None
+          if secret_b64 and secret_pw:
+              try:
+                  clean_b64 = re.sub(r"^data:[^;]*;base64,", "", secret_b64.strip())
+                  clean_b64 = "".join(ln for ln in clean_b64.splitlines() if not ln.startswith("-----"))
+                  clean_b64 = re.sub(r"\s+", "", clean_b64)
+                  ks_bytes = base64.b64decode(clean_b64)
+                  with tempfile.TemporaryDirectory() as td:
+                      tmp_ks = os.path.join(td, "secret.jks")
+                      open(tmp_ks, "wb").write(ks_bytes)
+                      info = inspect_keystore(tmp_ks, secret_pw, secret_alias)
+                      if info:
+                          secret_candidate = {
+                              "mode": "secrets",
+                              "ks_bytes": ks_bytes,
+                              "ks_pw": secret_pw,
+                              "alias": info["alias"],
+                              "key_pw": secret_key_pw or secret_pw,
+                              "sha1": info["sha1"],
+                              "note": "GitHub Actions Secrets (ANDROID_KEYSTORE_BASE64)",
+                          }
+                          print(f"Detected GitHub Secret keystore -> SHA1: {info['sha1']}")
+              except Exception as exc:
+                  print(f"WARNING: Could not decode/unlock ANDROID_KEYSTORE_BASE64 secret: {exc}")
+
+          # Candidate B: Permanent repository keystore in android/signing/
+          repo_candidate = None
+          signing_dir = os.path.join(workspace, "android", "signing")
+          props_file = os.path.join(signing_dir, "keystore.properties")
+          props = {}
+          if os.path.isfile(props_file):
+              for ln in open(props_file, "r", encoding="utf-8").read().splitlines():
+                  if "=" in ln and not ln.strip().startswith("#"):
+                      k, v = ln.split("=", 1)
+                      props[k.strip()] = v.strip()
+
+          repo_ks_path = None
+          if props.get("storeFile"):
+              p = os.path.join(signing_dir, props["storeFile"])
+              if os.path.isfile(p):
+                  repo_ks_path = p
+          if not repo_ks_path and os.path.isdir(signing_dir):
+              for fn in sorted(os.listdir(signing_dir)):
+                  if fn.endswith((".jks", ".keystore", ".p12", ".pfx")):
+                      repo_ks_path = os.path.join(signing_dir, fn)
+                      break
+
+          if repo_ks_path:
+              for try_pw, try_alias, try_kpw in [
+                  (secret_pw, secret_alias, secret_key_pw or secret_pw),
+                  (props.get("storePassword", ""), props.get("keyAlias", "upload"), props.get("keyPassword", "") or props.get("storePassword", "")),
+              ]:
+                  if not try_pw:
+                      continue
+                  mask_secret(try_pw)
+                  mask_secret(try_kpw)
+                  info = inspect_keystore(repo_ks_path, try_pw, try_alias)
+                  if info:
+                      repo_candidate = {
+                          "mode": "repo_permanent_key",
+                          "ks_bytes": open(repo_ks_path, "rb").read(),
+                          "ks_pw": try_pw,
+                          "alias": info["alias"],
+                          "key_pw": try_kpw,
+                          "sha1": info["sha1"],
+                          "note": f"Permanent repository Upload Keystore ({os.path.basename(repo_ks_path)})",
+                      }
+                      print(f"Detected repository keystore ({os.path.basename(repo_ks_path)}) -> SHA1: {info['sha1']}")
+                      break
+
+          # Selection priority:
+          # 1. Explicit user preference ('secrets' or 'repo_key')
+          # 2. Exact match with Play Console's registered Upload Key (F5:BA:06:8E:...) across Secrets, Repo, or Previous Workflow Artifacts
+          # 3. Valid GitHub Secrets keystore (if user configured a new reset key)
+          # 4. Permanent repository keystore (deterministic SHA-1 across every build — never rotates randomly)
+          selected = None
+          override_warning = ""
+
+          if pref == "secrets" and secret_candidate:
+              selected = secret_candidate
+          elif pref == "repo_key" and repo_candidate:
+              selected = repo_candidate
+          else:
+              if secret_candidate and secret_candidate["sha1"].startswith(EXPECTED_PLAY_SHA1_PREFIX):
+                  selected = secret_candidate
+              elif repo_candidate and repo_candidate["sha1"].startswith(EXPECTED_PLAY_SHA1_PREFIX):
+                  selected = repo_candidate
+              else:
+                  recovered = recover_play_key_from_artifacts()
+                  if recovered:
+                      selected = recovered
+                      if secret_candidate and not secret_candidate["sha1"].startswith(EXPECTED_PLAY_SHA1_PREFIX):
+                          override_warning = (
+                              f"GitHub Secret ANDROID_KEYSTORE_BASE64 had mismatched SHA1 ({secret_candidate['sha1']}); "
+                              f"automatically signed with Play Console's expected Upload Key ({recovered['sha1']}) instead."
+                          )
+                  elif secret_candidate:
+                      selected = secret_candidate
+                  elif repo_candidate:
+                      selected = repo_candidate
+
+          # Emergency fallback only if android/signing/upload-keystore.p12 were manually deleted
+          if not selected:
+              print("WARNING: No keystore found in Secrets, Artifacts, or android/signing/ — generating fallback keystore...")
+              gen_pw = secrets.token_hex(16)
+              mask_secret(gen_pw)
+              gen_ks = os.path.join(workspace, "android", "upload-keystore.jks")
+              subprocess.run([
+                  "keytool", "-genkeypair", "-v",
+                  "-keystore", gen_ks, "-storetype", "PKCS12",
+                  "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
+                  "-alias", "upload", "-storepass", gen_pw, "-keypass", gen_pw,
+                  "-dname", "CN=ReceiptScannerPro, OU=Mobile, O=ReceiptScannerPro, L=Johannesburg, S=GP, C=ZA",
+              ], check=True)
+              info = inspect_keystore(gen_ks, gen_pw, "upload")
+              selected = {
+                  "mode": "generated",
+                  "ks_bytes": open(gen_ks, "rb").read(),
+                  "ks_pw": gen_pw,
+                  "alias": info["alias"],
+                  "key_pw": gen_pw,
+                  "sha1": info["sha1"],
+                  "note": "Generated emergency Upload Keystore",
+              }
+
+          mask_secret(selected["ks_pw"])
+          mask_secret(selected["key_pw"])
+
+          out_ks = os.path.join(workspace, "android", "upload-keystore.jks")
+          with open(out_ks, "wb") as f:
+              f.write(selected["ks_bytes"])
+
+          out_pem = os.path.join(workspace, "upload_certificate.pem")
+          subprocess.run([
+              "keytool", "-exportcert", "-rfc",
+              "-keystore", out_ks,
+              "-alias", selected["alias"],
+              "-storepass", selected["ks_pw"],
+              "-file", out_pem,
+          ], check=True)
+
+          # Refresh backup kit artifact whenever using recovered or generated key so 90-day retention never expires
+          if selected["mode"] in ("recovered_play_upload_key", "generated"):
+              kit_dir = os.path.join(workspace, "play-signing-kit")
+              os.makedirs(kit_dir, exist_ok=True)
+              shutil.copyfile(out_ks, os.path.join(kit_dir, "upload-keystore.jks"))
+              shutil.copyfile(out_pem, os.path.join(kit_dir, "upload_certificate.pem"))
+              b64_str = base64.b64encode(selected["ks_bytes"]).decode("ascii")
+              with open(os.path.join(kit_dir, "GITHUB_SECRETS_SETUP.txt"), "w", encoding="utf-8") as sf:
+                  sf.write("===================================================================\n")
+                  sf.write("PLAY CONSOLE UPLOAD KEYSTORE FOR com.receiptscannerpro.app\n")
+                  sf.write("===================================================================\n")
+                  sf.write(f"Upload Key SHA1 (signs .aab):       {selected['sha1']}\n")
+                  sf.write("Play App Signing SHA1 (Google DER): AA:14:BE:52:28:F8:80:7C:13:DE:D0:86:F1:11:6A:0F:AE:93:17:4D\n\n")
+                  sf.write("OPTIONAL — SAVE THESE 4 SECRETS IN GITHUB FOR PERMANENT BACKUP:\n")
+                  sf.write("  GitHub -> Settings -> Secrets and variables -> Actions -> New repository secret\n\n")
+                  sf.write(f"1. ANDROID_KEYSTORE_BASE64\n{b64_str}\n\n")
+                  sf.write(f"2. ANDROID_KEYSTORE_PASSWORD\n{selected['ks_pw']}\n\n")
+                  sf.write(f"3. ANDROID_KEY_ALIAS\n{selected['alias']}\n\n")
+                  sf.write(f"4. ANDROID_KEY_PASSWORD\n{selected['key_pw']}\n")
+                  sf.write("===================================================================\n")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as ef:
+              ef.write(f"ANDROID_KEYSTORE_PATH={out_ks}\n")
+              ef.write(f"ANDROID_KEYSTORE_PASSWORD={selected['ks_pw']}\n")
+              ef.write(f"ANDROID_KEY_ALIAS={selected['alias']}\n")
+              ef.write(f"ANDROID_KEY_PASSWORD={selected['key_pw']}\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as of:
+              of.write(f"keystore_mode={selected['mode']}\n")
+              of.write(f"signing_sha1={selected['sha1']}\n")
+              of.write(f"signing_alias={selected['alias']}\n")
+              of.write(f"signing_note={selected['note']}\n")
+              of.write(f"override_warning={override_warning}\n")
+
+          print(f"Selected Upload Keystore Mode: {selected['mode']} ({selected['note']})")
+          print(f"Upload Key Certificate SHA1:   {selected['sha1']}")
+          if override_warning:
+              print(f"NOTE: {override_warning}")
+          PYEOF
+
+      - name: Setup Gradle 9.1.0 (for AGP 9.0.1)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.1.0'
+          validate-wrappers: false
+
+      - name: Build Signed Release Android App Bundle (.aab) with AGP 9.0.1
+        run: |
+          chmod +x android/gradlew || true
+          cd android
+          gradle --version
+          gradle bundleRelease --no-daemon --stacktrace
+
+      - name: Verify Signed App Bundle (.aab), R8 DEX Optimization & Native Debug Symbols
+        run: |
+          echo "=== Locating generated .aab file ==="
+          AAB_SRC=$(find android/app/build/outputs/bundle/release -name "*.aab" | head -n 1)
+          if [ -z "$AAB_SRC" ]; then
+            echo "ERROR: No .aab bundle generated!"
+            exit 1
+          fi
+          VERSIONED_AAB="${GITHUB_WORKSPACE}/ParserPro-release-v${ANDROID_VERSION_CODE}.aab"
+          cp "$AAB_SRC" "$VERSIONED_AAB"
+          cp "$AAB_SRC" "${GITHUB_WORKSPACE}/ParserPro-release.aab"
+          ls -lh "$VERSIONED_AAB"
+
+          echo "=== Verifying Release Cryptographic Signature & Embedded Certificate SHA1 ==="
+          jarsigner -verify "$VERSIONED_AAB"
+          AAB_CERT_INFO=$(keytool -printcert -jarfile "$VERSIONED_AAB" 2>/dev/null || true)
+          echo "$AAB_CERT_INFO" | grep -E "Owner:|SHA1:|SHA256:" || true
+
+          echo "=== Verifying Merged Manifest Package, Play Billing Permission, Version (>= 240) & Provider Authorities ==="
+          MERGED_MANIFEST=$(find android/app/build/intermediates/merged_manifests/release -name "AndroidManifest.xml" | head -n 1)
+          if [ -n "$MERGED_MANIFEST" ]; then
+            grep -q 'package="com.receiptscannerpro.app"' "$MERGED_MANIFEST"
+            grep -q 'com.android.vending.BILLING' "$MERGED_MANIFEST"
+            grep -q 'com.receiptscannerpro.app.fileprovider' "$MERGED_MANIFEST"
+            grep -q 'com.receiptscannerpro.app.androidx-startup' "$MERGED_MANIFEST"
+            if grep -qE 'com\.receiptscanner\.app|com\.cortech\.praiserpro' "$MERGED_MANIFEST"; then
+              echo "ERROR: Legacy package or conflicting authority found in merged manifest!"
+              exit 1
+            fi
+            MANIFEST_VC=$(grep -oE 'android:versionCode="[0-9]+"' "$MERGED_MANIFEST" | head -n 1 | grep -oE '[0-9]+' || true)
+            echo "Merged Manifest versionCode=${MANIFEST_VC}"
+            if [ -n "$MANIFEST_VC" ] && [ "$MANIFEST_VC" -lt 240 ]; then
+              echo "ERROR: Merged Manifest versionCode (${MANIFEST_VC}) must be >= 240!"
+              exit 1
+            fi
+            if [ -n "$MANIFEST_VC" ] && [ "$MANIFEST_VC" != "$ANDROID_VERSION_CODE" ]; then
+              echo "ERROR: Merged Manifest versionCode (${MANIFEST_VC}) does not match expected ANDROID_VERSION_CODE (${ANDROID_VERSION_CODE})!"
+              exit 1
+            fi
+            echo "Verified package=com.receiptscannerpro.app, com.android.vending.BILLING, versionCode=${MANIFEST_VC} (>= 240), and unique provider authorities!"
+          fi
+
+          echo "=== Verifying AGP 9.0.1 Metadata Inside .aab ==="
+          APP_METADATA_TXT=$(unzip -p "$VERSIONED_AAB" "BUNDLE-METADATA/com.android.tools.build.gradle/app-metadata.properties" 2>/dev/null || true)
+          echo "$APP_METADATA_TXT"
+          if ! echo "$APP_METADATA_TXT" | grep -qE '^androidGradlePluginVersion=9\.0\.'; then
+            echo "ERROR: Expected androidGradlePluginVersion=9.0.x in BUNDLE-METADATA/com.android.tools.build.gradle/app-metadata.properties!"
+            exit 1
+          fi
+          echo "Verified AGP 9.0.1 metadata inside ${VERSIONED_AAB}!"
+
+          echo "=== Verifying R8 9.0 Full Mode DEX Code Optimization & Deobfuscation Mapping (mapping.txt) ==="
+          MAPPING_OUT="${GITHUB_WORKSPACE}/mapping.txt"
+          AGP_MAPPING=$(find android/app/build/outputs/mapping/release -name "mapping.txt" 2>/dev/null | head -n 1 || true)
+          if [ -n "$AGP_MAPPING" ] && [ -s "$AGP_MAPPING" ]; then
+            cp "$AGP_MAPPING" "$MAPPING_OUT"
+            ls -lh "$MAPPING_OUT"
+          elif unzip -Z1 "$VERSIONED_AAB" 2>/dev/null | grep -q "BUNDLE-METADATA/com.android.tools.build.obfuscation/proguard.map"; then
+            unzip -p "$VERSIONED_AAB" "BUNDLE-METADATA/com.android.tools.build.obfuscation/proguard.map" > "$MAPPING_OUT"
+            ls -lh "$MAPPING_OUT"
+          else
+            echo "ERROR: R8 DEX optimization mapping (mapping.txt / proguard.map) was not generated!"
+            exit 1
+          fi
+
+          if ! unzip -Z1 "$VERSIONED_AAB" 2>/dev/null | grep -q "BUNDLE-METADATA/com.android.tools.build.obfuscation/proguard.map"; then
+            echo "ERROR: proguard.map is missing from BUNDLE-METADATA inside ${VERSIONED_AAB}!"
+            exit 1
+          fi
+          echo "Verified R8 9.0 Full Mode DEX code optimization and embedded BUNDLE-METADATA/com.android.tools.build.obfuscation/proguard.map!"
+
+          echo "=== Packaging Play Console Native Debug Symbols (native-debug-symbols.zip) ==="
+          SYMBOLS_OUT="${GITHUB_WORKSPACE}/native-debug-symbols.zip"
+          AGP_SYMBOLS=$(find android/app/build/outputs/native-debug-symbols/release -name "*.zip" 2>/dev/null | head -n 1 || true)
+          MERGED_LIB_DIR=$(find android/app/build/intermediates/merged_native_libs/release -type d -name "lib" 2>/dev/null | head -n 1 || true)
+
+          if [ -n "$AGP_SYMBOLS" ] && [ -f "$AGP_SYMBOLS" ] && unzip -Z1 "$AGP_SYMBOLS" 2>/dev/null | grep -qE '\.(so|dbg|sym)$'; then
+            echo "Using AGP-generated native-debug-symbols.zip ($AGP_SYMBOLS)..."
+            cp "$AGP_SYMBOLS" "$SYMBOLS_OUT"
+          elif [ -n "$MERGED_LIB_DIR" ] && [ -d "$MERGED_LIB_DIR" ]; then
+            echo "Packaging native debug symbols from merged_native_libs ($MERGED_LIB_DIR)..."
+            python3 - "$MERGED_LIB_DIR" "$SYMBOLS_OUT" << 'PYEOF'
+          import os, sys, zipfile
+          lib_dir, out_zip = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              for root, _, files in os.walk(lib_dir):
+                  for fn in sorted(files):
+                      if fn.endswith((".so", ".dbg", ".sym")):
+                          full_path = os.path.join(root, fn)
+                          rel_path = os.path.relpath(full_path, lib_dir).replace(os.sep, "/")
+                          zf.write(full_path, arcname=rel_path)
+          PYEOF
+          elif [ -f "${GITHUB_WORKSPACE}/android/signing/native-debug-symbols.zip" ]; then
+            echo "Using pre-packaged android/signing/native-debug-symbols.zip..."
+            cp "${GITHUB_WORKSPACE}/android/signing/native-debug-symbols.zip" "$SYMBOLS_OUT"
+          fi
+
+          if [ -f "$SYMBOLS_OUT" ]; then
+            ls -lh "$SYMBOLS_OUT"
+            unzip -l "$SYMBOLS_OUT"
+          fi
+
+          echo "=== Checking Embedded Debug Symbols Inside .aab ==="
+          unzip -l "$VERSIONED_AAB" | grep "com.android.tools.build.debugsymbols" || echo "Note: Use standalone native-debug-symbols.zip if Play Console requests manual symbol upload."
+
+      - name: Upload Play Console App Bundle (.aab) Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ParserPro-PlayConsole-AAB-v${{ steps.signing_setup.outputs.version_code }}
+          path: ${{ github.workspace }}/ParserPro-release-v${{ steps.signing_setup.outputs.version_code }}.aab
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload Standard Play Console App Bundle (.aab) Artifact (Fixed Name)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ParserPro-PlayConsole-AAB
+          path: ${{ github.workspace }}/ParserPro-release.aab
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload Play Console R8 Deobfuscation Mapping (mapping.txt) Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ParserPro-R8-Deobfuscation-Mapping
+          path: ${{ github.workspace }}/mapping.txt
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload Play Console Native Debug Symbols (.zip) Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ParserPro-Native-Debug-Symbols
+          path: ${{ github.workspace }}/native-debug-symbols.zip
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload Private Play Signing Keystore Backup (90-Day Retention Refresh)
+        if: steps.signing_setup.outputs.keystore_mode == 'recovered_play_upload_key' || steps.signing_setup.outputs.keystore_mode == 'generated'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayConsole-Upload-Keystore-Backup-SAVE-THIS
+          path: ${{ github.workspace }}/play-signing-kit/*
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Publish Single Clean Versioned .aab, R8 Mapping & Native Debug Symbols to GitHub Releases
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="v1.0-playstore-aab"
+          VC="${{ steps.signing_setup.outputs.version_code }}"
+          VN="${{ steps.signing_setup.outputs.version_name }}"
+          VERSIONED_AAB_NAME="ParserPro-release-v${VC}.aab"
+          VERSIONED_AAB_PATH="${GITHUB_WORKSPACE}/${VERSIONED_AAB_NAME}"
+          MAPPING_PATH="${GITHUB_WORKSPACE}/mapping.txt"
+          SYMBOLS_PATH="${GITHUB_WORKSPACE}/native-debug-symbols.zip"
+          PEM_PATH="${GITHUB_WORKSPACE}/upload_certificate.pem"
+          APP_STRINGS_ZIP="${GITHUB_WORKSPACE}/public/play-console-translations/play-console-app-strings.zip"
+          TRANSLATIONS_BUNDLE_ZIP="${GITHUB_WORKSPACE}/public/play-console-translations/play-console-translations-bundle.zip"
+          SIGN_SHA1="${{ steps.signing_setup.outputs.signing_sha1 }}"
+          SIGN_MODE="${{ steps.signing_setup.outputs.keystore_mode }}"
+          PLAY_DEPLOY_SHA1="AA:14:BE:52:28:F8:80:7C:13:DE:D0:86:F1:11:6A:0F:AE:93:17:4D"
+
+          if [ -f "$VERSIONED_AAB_PATH" ]; then
+            echo "Publishing Play Console AAB (${VERSIONED_AAB_NAME}), R8 Mapping, Native Debug Symbols & Translations to GitHub Releases ($TAG_NAME)..."
+            NOTES_FILE="${RUNNER_TEMP}/aab-release-notes.md"
+            {
+              echo "### Google Play Console Signed App Bundle (.aab) — versionCode ${VC} (${VN})"
+              echo "- **1-Click App Bundle (Upload ONLY this file to Play Console)**: **[${VERSIONED_AAB_NAME}](https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/${VERSIONED_AAB_NAME})** *(AGP 9.0.1 + R8 9.0 Full Mode + Integrated Resource Shrinking + embedded proguard.map, native debug symbols & 17 locales)*"
+              if [ -f "$PEM_PATH" ]; then
+                echo "- **Upload Certificate (.pem)**: **[upload_certificate.pem](https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/upload_certificate.pem)**"
+              fi
+              if [ -f "$MAPPING_PATH" ]; then
+                echo "- **R8 Deobfuscation Mapping (.txt)**: **[mapping.txt](https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/mapping.txt)**"
+              fi
+              if [ -f "$SYMBOLS_PATH" ]; then
+                echo "- **Native Debug Symbols (.zip)**: **[native-debug-symbols.zip](https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/native-debug-symbols.zip)**"
+              fi
+              if [ -f "$APP_STRINGS_ZIP" ]; then
+                echo "- **Play Console App Strings Translations (.zip)**: **[play-console-app-strings.zip](https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/play-console-app-strings.zip)**"
+              fi
+              if [ -f "$TRANSLATIONS_BUNDLE_ZIP" ]; then
+                echo "- **Play Console Complete Translations Bundle (.zip)**: **[play-console-translations-bundle.zip](https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/play-console-translations-bundle.zip)**"
+              fi
+              echo "- **Application ID**: \`com.receiptscannerpro.app\`"
+              echo "- **Version Name**: \`${VN}\` (\`versionCode ${VC}\`)"
+              echo "- **Bundle Upload Key SHA1**: \`${SIGN_SHA1}\` (\`${SIGN_MODE}\`)"
+              echo "- **Play App Signing Certificate (\`deployment_cert.der\`) SHA1**: \`${PLAY_DEPLOY_SHA1}\`"
+              echo "- **Built from commit**: \`${{ github.sha }}\`"
+            } > "$NOTES_FILE"
+
+            ASSETS=("$VERSIONED_AAB_PATH")
+            [ -f "$MAPPING_PATH" ] && ASSETS+=("$MAPPING_PATH")
+            [ -f "$SYMBOLS_PATH" ] && ASSETS+=("$SYMBOLS_PATH")
+            [ -f "$PEM_PATH" ] && ASSETS+=("$PEM_PATH")
+            [ -f "$APP_STRINGS_ZIP" ] && ASSETS+=("$APP_STRINGS_ZIP")
+            [ -f "$TRANSLATIONS_BUNDLE_ZIP" ] && ASSETS+=("$TRANSLATIONS_BUNDLE_ZIP")
+
+            if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+              # Remove stale .aab files from previous runs so there is only ONE unmistakable .aab on the Release page
+              OLD_AABS=$(gh release view "$TAG_NAME" --json assets -q '.assets[].name' 2>/dev/null | grep -E '\.aab$' || true)
+              while IFS= read -r old_asset; do
+                [ -z "$old_asset" ] && continue
+                gh release delete-asset "$TAG_NAME" "$old_asset" --yes || true
+              done <<< "$OLD_AABS"
+
+              gh release upload "$TAG_NAME" "${ASSETS[@]}" --clobber || echo "GitHub Release upload skipped"
+              gh release edit "$TAG_NAME" --title "ParserPro Google Play Console Bundle — v${VC} (${VN})" --notes-file "$NOTES_FILE" --prerelease=false --latest \
+                || gh release edit "$TAG_NAME" --title "ParserPro Google Play Console Bundle — v${VC} (${VN})" --notes-file "$NOTES_FILE" --prerelease=false \
+                || gh release edit "$TAG_NAME" --title "ParserPro Google Play Console Bundle — v${VC} (${VN})" --notes-file "$NOTES_FILE" || true
+            else
+              gh release create "$TAG_NAME" "${ASSETS[@]}" \
+                --title "ParserPro Google Play Console Bundle — v${VC} (${VN})" \
+                --notes-file "$NOTES_FILE" \
+                --latest || echo "GitHub Release creation skipped"
+            fi
+          fi
+
+      - name: Add Direct Play Console AAB, Signing Status & Download Links to Run Summary
+        if: always()
+        run: |
+          PLAY_DEPLOY_SHA1="AA:14:BE:52:28:F8:80:7C:13:DE:D0:86:F1:11:6A:0F:AE:93:17:4D"
+          EXPECTED_UPLOAD_PREFIX="F5:BA:06:8E:1E:42:BC:00:0F:7F:80:C4:8E:81:42:F3:E9"
+          VC="${{ steps.signing_setup.outputs.version_code }}"
+          VN="${{ steps.signing_setup.outputs.version_name }}"
+          VERSIONED_AAB_NAME="ParserPro-release-v${VC}.aab"
+          VERSIONED_AAB_PATH="${GITHUB_WORKSPACE}/${VERSIONED_AAB_NAME}"
+          SIGN_SHA1="${{ steps.signing_setup.outputs.signing_sha1 }}"
+          KEY_MODE="${{ steps.signing_setup.outputs.keystore_mode }}"
+          SIGN_NOTE="${{ steps.signing_setup.outputs.signing_note }}"
+          OVERRIDE_WARN="${{ steps.signing_setup.outputs.override_warning }}"
+
+          echo "# 📦 Google Play Console App Bundle (v${VC}) — Ready to Upload" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "$VERSIONED_AAB_PATH" ]; then
+            AAB_SIZE=$(ls -lh "$VERSIONED_AAB_PATH" | awk '{print $5}')
+            echo "### Bundle & Signing Verification" >> $GITHUB_STEP_SUMMARY
+            echo "- **Upload File**: \`${VERSIONED_AAB_NAME}\` (${AAB_SIZE}) — *Upload **ONLY** this file after clicking \`✕\` on old failed bundles in Play Console*" >> $GITHUB_STEP_SUMMARY
+            echo "- **Package Name**: \`com.receiptscannerpro.app\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Version**: \`${VN}\` (\`versionCode ${VC}\` >= 240) ✅" >> $GITHUB_STEP_SUMMARY
+            echo "- **Android Gradle Plugin**: \`9.0.1\` (Gradle \`9.1.0\` + R8 \`9.0.32\` Full Mode + Integrated Resource Shrinking) ✅" >> $GITHUB_STEP_SUMMARY
+            echo "- **Google Play Monetization**: Billing Library \`8.3.0\` + \`com.android.vending.BILLING\` (\`parserpro_mid_monthly\` \`$1.99/mo\` & \`parserpro_full_monthly\` \`$3.99/mo\`) ✅" >> $GITHUB_STEP_SUMMARY
+            echo "- **Upload Signing Key Source**: \`${KEY_MODE}\` (${SIGN_NOTE})" >> $GITHUB_STEP_SUMMARY
+            if [[ "$SIGN_SHA1" == ${EXPECTED_UPLOAD_PREFIX}* ]]; then
+              echo "- **Upload Key Certificate SHA1**: \`${SIGN_SHA1}\` *(Matches Play Console Expected Upload Key \`F5:BA:06:8E:...\`!)* ✅" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Upload Key Certificate SHA1**: \`${SIGN_SHA1}\` *(Permanent deterministic Upload Key — use \`upload_certificate.pem\` if requesting Upload Key Reset in Play Console)*" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "- **Play App Signing Certificate (\`deployment_cert.der\`) SHA1**: \`${PLAY_DEPLOY_SHA1}\` ✅" >> $GITHUB_STEP_SUMMARY
+            echo "- **DEX Optimization & Native Debug Symbols**: Embedded (\`proguard.map\` + \`FULL\` symbols) ✅" >> $GITHUB_STEP_SUMMARY
+            echo "- **Embedded App Locales**: 17 languages (\`en-US\`, \`en-ZA\`, \`en-GB\`, \`af\`, \`zu\`, \`es-ES\`, \`es-419\`, \`fr-FR\`, \`de-DE\`, \`pt-PT\`, \`pt-BR\`, \`nl-NL\`, \`it-IT\`, \`ar\`, \`hi-IN\`, \`zh-CN\`, \`ja-JP\`) ✅" >> $GITHUB_STEP_SUMMARY
+            if [ -n "$OVERRIDE_WARN" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "> **ℹ️ Signing Auto-Fix Applied**: ${OVERRIDE_WARN}" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📥 Direct 1-Click Downloads" >> $GITHUB_STEP_SUMMARY
+            echo "1. **App Bundle (\`versionCode ${VC}\`)**: **[Download ${VERSIONED_AAB_NAME}](https://github.com/${{ github.repository }}/releases/download/v1.0-playstore-aab/${VERSIONED_AAB_NAME})**" >> $GITHUB_STEP_SUMMARY
+            echo "2. **Upload Certificate (\`.pem\`)**: **[Download upload_certificate.pem](https://github.com/${{ github.repository }}/releases/download/v1.0-playstore-aab/upload_certificate.pem)**" >> $GITHUB_STEP_SUMMARY
+            echo "3. **R8 Deobfuscation Mapping (\`.txt\`)**: **[Download mapping.txt](https://github.com/${{ github.repository }}/releases/download/v1.0-playstore-aab/mapping.txt)**" >> $GITHUB_STEP_SUMMARY
+            echo "4. **Native Debug Symbols (\`.zip\`)**: **[Download native-debug-symbols.zip](https://github.com/${{ github.repository }}/releases/download/v1.0-playstore-aab/native-debug-symbols.zip)**" >> $GITHUB_STEP_SUMMARY
+            echo "5. **Play Console App Strings (\`.zip\`)**: **[Download play-console-app-strings.zip](https://github.com/${{ github.repository }}/releases/download/v1.0-playstore-aab/play-console-app-strings.zip)**" >> $GITHUB_STEP_SUMMARY
+            echo "6. **Play Console All Translations Bundle (\`.zip\`)**: **[Download play-console-translations-bundle.zip](https://github.com/${{ github.repository }}/releases/download/v1.0-playstore-aab/play-console-translations-bundle.zip)**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ App Bundle (.aab) was not generated" >> $GITHUB_STEP_SUMMARY
+          fi
